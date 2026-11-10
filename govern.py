@@ -90,7 +90,10 @@ def apply():
         pre.append({"hooks": [{"type": "command", "command": '"$(command -v python || command -v python3)" "$CLAUDE_PROJECT_DIR/.claude/hooks/budget.py"'}]})
     if pre:
         settings["hooks"]["PreToolUse"] = pre
+    shutil.rmtree(ROOT / "checks", ignore_errors=True)
     if sw["check"]:
+        (ROOT / "checks").mkdir()
+        (ROOT / "checks" / "check.py").write_text(P["checks/check.py"], encoding="utf-8")
         (cdir / "hooks" / "stop_check.py").write_text(P["hooks/stop_check.py"], encoding="utf-8")
         settings["hooks"]["Stop"] = [{"hooks": [{"type": "command", "command": '"$(command -v python || command -v python3)" "$CLAUDE_PROJECT_DIR/.claude/hooks/stop_check.py"', "timeout": 60}]}]
     if sw["human_gate"]:
