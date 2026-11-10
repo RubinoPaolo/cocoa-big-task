@@ -1,0 +1,10 @@
+# Your switches. Change on / off, then run: python govern.py apply
+# First run: everything off.
+
+context: off      # CLAUDE.md lines with what people here know (block 2)
+spec: off         # acceptance criteria for your piece (block 2)
+check: off        # pass/fail check that runs before the agent may stop (block 3)
+hard_rules: off   # locks in the harness: what may be sent, to whom (block 4)
+human_gate: off   # you approve before anything is sent (block 5)
+reviewer: off     # a read-only reviewer agent, at most two rounds (block 6)
+budget: off       # at most 25 tool calls per run (block 4)

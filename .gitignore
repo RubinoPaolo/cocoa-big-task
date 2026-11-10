@@ -1,0 +1,13 @@
+.claude/state/
+__pycache__/
+.trace/
+runs_piece*.zip
+work/
+out/
+outbox/
+.claude/
+.govern/piece
+CLAUDE.md
+TASK.md
+specs/
+runs/
