@@ -1,221 +1,357 @@
 #!/usr/bin/env python3
-"""Course switchboard.
+"""Course machinery for the big task. Students never run this file: Claude Code runs it through
+the hooks in .claude/settings.json.
 
-  python govern.py piece 2    choose your piece (1, 2 or 3): writes TASK.md and prepares work/
-  python govern.py            show your piece and your switches
-  python govern.py apply      turn the switches in governance.yaml into real Claude Code files
-  python govern.py log "..."  save this run (switches, output, trace, cost) to runs/, then reset
-  python govern.py reset      clear work/, out/ and outbox/ for a new run
-  python govern.py pack       put all your runs in one zip file to hand in
+  Every new session  (SessionStart)  reads governance.yaml, prepares TASK.md and work/, turns the switches on
+  Every tool call    (PreToolUse)    applies the switches that act on tools: hard_rules, human_gate, budget
+  Every stop         (Stop)          runs the check if it is on, then saves this run to runs/ (and to the class board)
 
-Edit governance.yaml (on / off), run apply, start Claude Code, paste: Do the task in TASK.md."""
-import base64, datetime, json, os, re, shutil, sys, zlib
+Course team only:
+  python govern.py            show the piece and the switches
+  python govern.py pack       put all saved runs in one zip file (fallback if the class board is not reachable)"""
+import base64, datetime, json, os, re, shutil, subprocess, sys, urllib.request, zlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 G = ROOT / ".govern"
+STATE = ROOT / ".claude" / "state"
 SWITCHES = ["context", "spec", "check", "hard_rules", "human_gate", "reviewer", "budget"]
+BUDGET = 25
+CHECK_MAX = 3
+# US dollars per million tokens: input, output, cache read, cache write 5 min, cache write 1 h
+PRICES = {"opus": (4, 20, 0.2, 5, 8), "sonnet": (2, 10, 0.1, 2.5, 4), "haiku": (1, 5, 0.05, 1.25, 2)}
 
 
+# ───────────── reading the switches
 def pack():
     return json.loads(zlib.decompress(base64.b64decode((G / "pack.b64").read_text())))
 
 
-def piece():
-    f = G / "piece"
-    if not f.exists():
-        sys.exit("Choose your piece first: python govern.py piece 1   (or 2, or 3)")
-    return f.read_text().strip()
-
-
-def choose(n):
-    if n not in ("1", "2", "3"):
-        sys.exit("The piece must be 1, 2 or 3.")
-    (G / "piece").write_text(n)
-    (ROOT / "TASK.md").write_text(pack()[f"tasks/piece{n}.md"], encoding="utf-8")
-    reset()
-    apply()
-    print(f"You build piece {n}. Read TASK.md, then start your first run with all switches off.")
-
-
-def read_switches():
-    sw = {k: False for k in SWITCHES}
+def read_yaml():
+    piece, sw = None, {k: False for k in SWITCHES}
     for line in (ROOT / "governance.yaml").read_text(encoding="utf-8").splitlines():
+        m = re.match(r"^\s*piece\s*:\s*([123])\b", line)
+        if m:
+            piece = m.group(1)
         m = re.match(r"^\s*([a-z_]+)\s*:\s*(on|off|true|false|yes|no)\b", line, re.I)
         if m and m.group(1) in sw:
             sw[m.group(1)] = m.group(2).lower() in ("on", "true", "yes")
-    return sw
+    return piece, sw
 
 
-def apply():
-    P, n, sw = pack(), piece(), read_switches()
-    claude = P["claude_base.md"]
-    if sw["context"]:
-        claude += P["context.md"]
-    spec_dir = ROOT / "specs"
-    shutil.rmtree(spec_dir, ignore_errors=True)
+def current():
+    try:
+        return json.loads((G / "current.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def out(obj):
+    print(json.dumps(obj))
+    sys.exit(0)
+
+
+# ───────────── SessionStart: a new run
+def prepare(piece, sw, P):
+    for d in ["out", "outbox", "work"]:
+        shutil.rmtree(ROOT / d, ignore_errors=True)
+        (ROOT / d).mkdir()
+    for key, text in P.items():
+        if key.startswith(f"fixtures/piece{piece}/"):
+            (ROOT / "work" / key.split("/")[-1]).write_text(text, encoding="utf-8")
+    (ROOT / "TASK.md").write_text(P[f"tasks/piece{piece}.md"], encoding="utf-8")
+    shutil.rmtree(ROOT / "specs", ignore_errors=True)
     if sw["spec"]:
-        spec_dir.mkdir()
-        (spec_dir / "SPEC.md").write_text(P[f"specs/piece{n}.md"], encoding="utf-8")
-        claude += P["spec_line.md"]
-    if sw["reviewer"]:
-        claude += P["reviewer_line.md"]
-    (ROOT / "CLAUDE.md").write_text(claude, encoding="utf-8")
-
-    cdir = ROOT / ".claude"
-    for sub in ["hooks", "agents"]:
-        shutil.rmtree(cdir / sub, ignore_errors=True)
-    (cdir / "hooks").mkdir(parents=True)
-    settings = {
-        "permissions": {
-            "allow": ["Bash(python:*)", "Bash(python3:*)", "Bash(ls:*)", "Bash(cat:*)", "Bash(head:*)", "Bash(wc:*)"],
-            "deny": ["Read(./.govern/**)", "Read(./runs/**)", "Read(./govern.py)", "Edit(./data/**)", "Write(./data/**)", "WebFetch", "WebSearch"],
-            "ask": [],
-        },
-        "hooks": {},
-    }
-    pre = []
-    # always on (course machinery, not a switch): every step of the agent goes to .trace/agent_trace.md
-    py = '"$(command -v python || command -v python3)" '
-    (cdir / "hooks" / "trace.py").write_text(P["hooks/trace.py"], encoding="utf-8")
-    trace = {"hooks": [{"type": "command", "command": py + '"$CLAUDE_PROJECT_DIR/.claude/hooks/trace.py"'}]}
-    settings["hooks"]["SessionStart"] = [trace]
-    settings["hooks"]["PostToolUse"] = [trace]
-    if sw["hard_rules"]:
-        settings["permissions"]["deny"] += ["Bash(rm:*)", "Bash(curl:*)", "Bash(wget:*)", "Bash(mail:*)"]
-        (cdir / "hooks" / "guard_send.py").write_text(P["hooks/guard_send.py"], encoding="utf-8")
-        pre.append({"matcher": "Bash", "hooks": [{"type": "command", "command": '"$(command -v python || command -v python3)" "$CLAUDE_PROJECT_DIR/.claude/hooks/guard_send.py"'}]})
-    if sw["budget"]:
-        (cdir / "hooks" / "budget.py").write_text(P["hooks/budget.py"], encoding="utf-8")
-        pre.append({"hooks": [{"type": "command", "command": '"$(command -v python || command -v python3)" "$CLAUDE_PROJECT_DIR/.claude/hooks/budget.py"'}]})
-    if pre:
-        settings["hooks"]["PreToolUse"] = pre
+        (ROOT / "specs").mkdir()
+        (ROOT / "specs" / "SPEC.md").write_text(P[f"specs/piece{piece}.md"], encoding="utf-8")
     shutil.rmtree(ROOT / "checks", ignore_errors=True)
     if sw["check"]:
         (ROOT / "checks").mkdir()
         (ROOT / "checks" / "check.py").write_text(P["checks/check.py"], encoding="utf-8")
-        (cdir / "hooks" / "stop_check.py").write_text(P["hooks/stop_check.py"], encoding="utf-8")
-        settings["hooks"]["Stop"] = [{"hooks": [{"type": "command", "command": '"$(command -v python || command -v python3)" "$CLAUDE_PROJECT_DIR/.claude/hooks/stop_check.py"', "timeout": 60}]}]
-    if sw["human_gate"]:
-        settings["permissions"]["ask"] += ["Bash(python tools/send.py:*)", "Bash(python3 tools/send.py:*)"]
+    agent = ROOT / ".claude" / "agents" / "piece-reviewer.md"
+    agent.unlink(missing_ok=True)
     if sw["reviewer"]:
-        (cdir / "agents").mkdir()
-        (cdir / "agents" / "piece-reviewer.md").write_text(P["reviewer.md"], encoding="utf-8")
-    (cdir / "settings.json").write_text(json.dumps(settings, indent=2), encoding="utf-8")
-    on = [k for k in SWITCHES if sw[k]]
-    print(f"Piece {n}. Switches on: {', '.join(on) if on else 'none'}. Applied.")
+        agent.parent.mkdir(parents=True, exist_ok=True)
+        agent.write_text(P["reviewer.md"], encoding="utf-8")
+    shutil.rmtree(STATE, ignore_errors=True)
+    (ROOT / ".trace").mkdir(exist_ok=True)
+    (ROOT / ".trace" / "agent_trace.md").write_text(
+        f"## Run started {datetime.datetime.now():%Y-%m-%d %H:%M}\n\n| Time | Step | What exactly |\n|---|---|---|\n", encoding="utf-8")
 
 
-def reset():
-    n = piece()
-    for d in ["out", "outbox"]:
-        shutil.rmtree(ROOT / d, ignore_errors=True)
-        (ROOT / d).mkdir()
-    shutil.rmtree(ROOT / "work", ignore_errors=True)
-    (ROOT / "work").mkdir()
-    for key, text in pack().items():
-        if key.startswith(f"fixtures/piece{n}/"):
-            (ROOT / "work" / key.split("/")[-1]).write_text(text, encoding="utf-8")
-    shutil.rmtree(ROOT / ".claude" / "state", ignore_errors=True)
-    shutil.rmtree(ROOT / ".trace", ignore_errors=True)
-    print(f"Piece {n}: work/, out/ and outbox/ are ready for a new run.")
+def on_session(d):
+    source = d.get("source", "startup")
+    cur = current()
+    if source in ("resume", "compact") and cur.get("session_id") == d.get("session_id"):
+        piece, sw = cur.get("piece"), cur.get("switches", {})   # same run continues: keep everything
+    else:
+        final = finalize(cur)
+        piece, sw = read_yaml()
+        if not piece:
+            (ROOT / "TASK.md").write_text("# Choose your piece first\n\nOpen `governance.yaml`, set `piece:` to 1, 2 or 3, save, then start a new session.\n", encoding="utf-8")
+            out({"systemMessage": "No piece chosen yet. Open governance.yaml, set piece: 1, 2 or 3, save, then start a new session.",
+                 "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "The student has not chosen a piece yet. If asked to do the task, say that they must set piece: 1, 2 or 3 in governance.yaml, save, and start a new session. Do nothing else."}})
+        prepare(piece, sw, pack())
+        G.mkdir(exist_ok=True)
+        (G / "current.json").write_text(json.dumps({"session_id": d.get("session_id"), "piece": piece, "switches": sw,
+                                                     "started": datetime.datetime.now().isoformat(timespec="seconds"),
+                                                     "transcript": d.get("transcript_path")}, indent=2))
+    P = pack()
+    ctx = ""
+    if sw.get("context"):
+        ctx += P["context.md"]
+    if sw.get("spec"):
+        ctx += P["spec_line.md"]
+    if sw.get("reviewer"):
+        ctx += P["reviewer_line.md"]
+    on = [k for k in SWITCHES if sw.get(k)]
+    msg = f"Big task · piece {piece} · switches on: {', '.join(on) if on else 'none'}. New run ready: ask Claude to do the task in TASK.md."
+    if source not in ("resume", "compact") and final:
+        msg = final + " " + msg
+    res = {"systemMessage": msg}
+    if ctx:
+        res["hookSpecificOutput"] = {"hookEventName": "SessionStart", "additionalContext": ctx}
+    out(res)
 
 
-def same_folder(a, b):
-    norm = lambda x: os.path.normcase(os.path.normpath(str(x)))
-    return norm(a) == norm(b)
+# ───────────── PreToolUse: the switches that act on tools
+def contract_prices():
+    known = set()
+    for c in (ROOT / "data" / "contracts").glob("*.md"):
+        for p in re.finditer(r"CHF\s?([\d,'’]+)\s?/\s?t", c.read_text(encoding="utf-8")):
+            digits = re.sub(r"\D", "", p.group(1))
+            if len(digits) >= 4:
+                known.add(digits)
+    return known
 
 
-def last_session():
-    """Newest Claude Code transcript of a task run in this repository: a session started in this
-    folder whose prompt asked for the task. Sessions that only ran govern.py are skipped."""
-    best = None
-    for p in (Path.home() / ".claude" / "projects").glob("*/*.jsonl"):
-        try:
-            text = p.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        if "TASK.md" not in text or "Do the task" not in text:
-            continue
-        cwd = None
-        for line in text.splitlines()[:50]:
-            try:
-                cwd = json.loads(line).get("cwd")
-            except (json.JSONDecodeError, AttributeError):
-                continue
-            if cwd:
+def guard_send(cmd, cwd):
+    """hard_rules: no recipient outside @alpstein-choc.ch, no contract price in what is sent."""
+    known = contract_prices()
+
+    def prices_in(text):
+        found = [p.group(0) for p in re.finditer(r"CHF\s?[\d'’,.]{3,}\s?(/\s?t\b|per\s+t)", text, re.I)]
+        found += [n.group(0) for n in re.finditer(r"\d[\d,'’]{2,}\d", text) if re.sub(r"\D", "", n.group(0)) in known]
+        return found
+
+    problems = []
+    send_part = cmd[cmd.rfind("send.py"):]
+    for grp in re.findall(r"--to[=\s]+[\"']?([^\"'\s]+)", send_part):
+        for a in grp.split(","):
+            a = a.strip()
+            if a and not a.lower().endswith("@alpstein-choc.ch"):
+                problems.append(f"recipient outside the company: {a}")
+    texts = {"the command": cmd}
+    bases = [ROOT, Path(cwd or ROOT)]
+    m = re.search(r"\bcd\s+([^\s;&|]+)", cmd)
+    if m:
+        bases.append(Path(m.group(1).strip("'\"")))
+    for f in re.findall(r"(\S+\.md)\b", send_part):
+        f = f.strip("'\"")
+        for b in bases:
+            p = Path(f) if Path(f).is_absolute() else b / f
+            if p.exists():
+                texts[f] = p.read_text(encoding="utf-8")
                 break
-        if cwd and same_folder(cwd, ROOT):
-            if best is None or p.stat().st_mtime > best.stat().st_mtime:
-                best = p
-    if not best:
-        return {}
-    tools, tin, tout, ts = 0, 0, 0, []
-    for line in open(best, encoding="utf-8"):
+    for where, text in texts.items():
+        for hit in sorted(set(prices_in(text))):
+            problems.append(f"{where} contains a contract price: '{hit}'")
+    return problems
+
+
+def decide(decision, reason):
+    out({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision, "permissionDecisionReason": reason}})
+
+
+def on_pre(d):
+    sw = current().get("switches", {})
+    tool, inp = d.get("tool_name", ""), d.get("tool_input", {}) or {}
+    cmd = inp.get("command", "") if tool == "Bash" else ""
+    if sw.get("budget"):
+        STATE.mkdir(parents=True, exist_ok=True)
+        c = STATE / f"budget_{d.get('session_id', 'x')}.txt"
+        n = int(c.read_text()) + 1 if c.exists() else 1
+        c.write_text(str(n))
+        if n > BUDGET:
+            decide("deny", f"Budget reached: {BUDGET} tool calls. Stop working. Write down what you have done and what is missing.")
+    if sw.get("hard_rules") and cmd:
+        if re.search(r"(^|[;&|]\s*)(rm|curl|wget|mail|sendmail)\b", cmd):
+            decide("deny", "Blocked by a hard rule: this command is not allowed in this repository.")
+        if "send.py" in cmd:
+            problems = guard_send(cmd, d.get("cwd"))
+            if problems:
+                decide("deny", "Blocked by a hard rule: " + "; ".join(problems))
+    if sw.get("human_gate") and "send.py" in cmd:
+        decide("ask", "Human approval is on. Open out/briefing.md and read it before you say yes.")
+    sys.exit(0)
+
+
+# ───────────── Stop: the check, then save the run
+def cost_of(transcript):
+    """Same figure as /cost: from the session's own record, or from its token counts."""
+    total, seen, tools, ts = None, set(), 0, []
+    usage = 0.0
+    try:
+        lines = open(transcript, encoding="utf-8").read().splitlines()
+    except (OSError, TypeError):
+        return None, None, None
+    for line in lines:
         try:
             d = json.loads(line)
         except json.JSONDecodeError:
             continue
         if d.get("timestamp"):
             ts.append(d["timestamp"])
-        if d.get("type") == "assistant":
-            u = d["message"].get("usage", {})
-            tin += u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
-            tout += u.get("output_tokens", 0)
-            tools += sum(1 for c in d["message"].get("content", []) if isinstance(c, dict) and c.get("type") == "tool_use")
+        if d.get("type") == "cost-state":
+            total = d.get("totalCostUSD")
+        if d.get("type") != "assistant":
+            continue
+        msg = d.get("message", {})
+        tools += sum(1 for c in msg.get("content", []) if isinstance(c, dict) and c.get("type") == "tool_use")
+        key = (msg.get("id"), d.get("requestId"))
+        if key in seen:
+            continue
+        seen.add(key)
+        u = msg.get("usage", {}) or {}
+        model = msg.get("model", "")
+        p = next((v for k, v in PRICES.items() if k in model), PRICES["opus"])
+        cc = u.get("cache_creation", {}) or {}
+        w5 = cc.get("ephemeral_5m_input_tokens", 0) or 0
+        w1 = cc.get("ephemeral_1h_input_tokens", 0) or 0
+        if not (w5 or w1):
+            w5 = u.get("cache_creation_input_tokens", 0) or 0
+        usage += (u.get("input_tokens", 0) * p[0] + u.get("output_tokens", 0) * p[1] + u.get("cache_read_input_tokens", 0) * p[2]
+                  + w5 * p[3] + w1 * p[4]) / 1e6
+    sub = Path(str(transcript)[:-6]) / "subagents" if str(transcript).endswith(".jsonl") else None
+    for f in (sorted(sub.glob("*.jsonl")) if sub and sub.exists() else []):   # helpers (reviewer) cost too
+        for line in open(f, encoding="utf-8"):
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg = d.get("message", {}) if d.get("type") == "assistant" else None
+            if not msg or (msg.get("id"), d.get("requestId")) in seen:
+                continue
+            seen.add((msg.get("id"), d.get("requestId")))
+            u = msg.get("usage", {}) or {}
+            p = next((v for k, v in PRICES.items() if k in msg.get("model", "")), PRICES["opus"])
+            cc = u.get("cache_creation", {}) or {}
+            w5, w1 = cc.get("ephemeral_5m_input_tokens", 0) or 0, cc.get("ephemeral_1h_input_tokens", 0) or 0
+            if not (w5 or w1):
+                w5 = u.get("cache_creation_input_tokens", 0) or 0
+            usage += (u.get("input_tokens", 0) * p[0] + u.get("output_tokens", 0) * p[1] + u.get("cache_read_input_tokens", 0) * p[2]
+                      + w5 * p[3] + w1 * p[4]) / 1e6
     mins = None
     if len(ts) > 1:
         f = lambda s: datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
         mins = round((f(ts[-1]) - f(ts[0])).total_seconds() / 60, 1)
-    return {"transcript": str(best), "tool_calls": tools, "tokens_in": tin, "tokens_out": tout, "minutes": mins}
+    return round(total if total is not None else usage, 2), tools, mins
 
 
-def log(note):
+def save_run(d):
+    cur = current()
+    if not cur.get("piece"):
+        return None
     runs = ROOT / "runs"; runs.mkdir(exist_ok=True)
-    k = len([p for p in runs.iterdir() if p.is_dir()]) + 1
-    dst = runs / f"run_{k:02d}"
+    index_f = G / "runs.json"
+    index = json.loads(index_f.read_text()) if index_f.exists() else {}
+    sid = d.get("session_id") or cur.get("session_id")
+    if sid not in index:
+        index[sid] = f"run_{len(index) + 1:02d}"
+        index_f.write_text(json.dumps(index, indent=2))
+    dst = runs / index[sid]
+    shutil.rmtree(dst, ignore_errors=True)
     dst.mkdir()
-    for d in ["work", "out", "outbox"]:
-        if (ROOT / d).exists():
-            shutil.copytree(ROOT / d, dst / d)
+    for name in ["work", "out", "outbox"]:
+        if (ROOT / name).exists():
+            shutil.copytree(ROOT / name, dst / name)
     if (ROOT / ".trace").exists():
         shutil.copytree(ROOT / ".trace", dst / "trace")
-    meta = {"piece": piece(), "switches": read_switches(), "note": note, "time": datetime.datetime.now().isoformat(timespec="seconds")}
-    meta.update(last_session())
-    m = re.search(r"\$\s?(\d+(?:[.,]\d+)?)", note)
-    if m:
-        meta["cost_usd"] = float(m.group(1).replace(",", "."))
+    cost, tools, mins = cost_of(d.get("transcript_path") or cur.get("transcript"))
+    meta = {"run": index[sid], "piece": cur["piece"], "switches": cur["switches"], "started": cur.get("started"),
+            "saved": datetime.datetime.now().isoformat(timespec="seconds"), "cost_usd": cost, "tool_calls": tools, "minutes": mins,
+            "who": os.environ.get("GITHUB_USER") or os.environ.get("USER", "")}
     (dst / "run.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    print(f"Saved as runs/run_{k:02d}. Tool calls: {meta.get('tool_calls')}, minutes: {meta.get('minutes')}, cost: {meta.get('cost_usd', 'not in your note')}.")
-    reset()
+    send_to_board(meta, dst)
+    return meta
 
 
+def send_to_board(meta, dst):
+    """If the course team has set a class-board address in .govern/board_url, send the run there too."""
+    url_f = G / "board_url"
+    if not url_f.exists() or not url_f.read_text().strip():
+        return
+    files = {}
+    for f in dst.rglob("*"):
+        if f.is_file() and f.suffix in (".json", ".md", ".eml", ".txt") and f.stat().st_size < 200_000:
+            files[str(f.relative_to(dst))] = f.read_text(encoding="utf-8", errors="replace")
+    body = json.dumps({**meta, "repo": os.environ.get("GITHUB_REPOSITORY", ""), "files": files}).encode()
+    try:
+        req = urllib.request.Request(url_f.read_text().strip(), data=body, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass   # the run is saved in runs/ anyway
+
+
+def finalize(cur):
+    """The previous run's transcript is complete now: store its final cost (the same figure as /cost)."""
+    try:
+        index = json.loads((G / "runs.json").read_text())
+        run = ROOT / "runs" / index[cur["session_id"]] / "run.json"
+        meta = json.loads(run.read_text())
+    except (OSError, KeyError, json.JSONDecodeError, TypeError):
+        return ""
+    cost, tools, mins = cost_of(cur.get("transcript"))
+    if cost is None:
+        return ""
+    meta.update({"cost_usd": cost, "tool_calls": tools, "minutes": mins, "final": True})
+    run.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    send_to_board(meta, run.parent)
+    return f"Your previous run ({meta['run']}) cost ${cost:.2f} in total."
+
+
+def on_stop(d):
+    cur = current()
+    sw = cur.get("switches", {})
+    if sw.get("check") and (ROOT / "checks" / "check.py").exists():
+        r = subprocess.run([sys.executable, "checks/check.py"], cwd=ROOT, capture_output=True, text=True)
+        if r.returncode != 0:
+            STATE.mkdir(parents=True, exist_ok=True)
+            c = STATE / f"check_blocks_{d.get('session_id', 'x')}.txt"
+            n = int(c.read_text()) + 1 if c.exists() else 1
+            c.write_text(str(n))
+            if n <= CHECK_MAX:
+                out({"decision": "block", "reason": "The check for your piece fails. Fix this before you finish:\n" + r.stdout[-2000:]})
+    meta = save_run(d)
+    if meta:
+        cost = f"${meta['cost_usd']:.2f}" if meta.get("cost_usd") is not None else "unknown"
+        out({"systemMessage": f"Saved as {meta['run']} · cost so far {cost}. For your next run: change governance.yaml, save, start a new session."})
+    sys.exit(0)
+
+
+# ───────────── course team
 def pack_runs():
     import zipfile
     runs = ROOT / "runs"
     if not runs.exists():
         sys.exit("No runs saved yet.")
-    name = ROOT / f"runs_piece{piece()}_{datetime.datetime.now():%Y%m%d-%H%M}.zip"
+    name = ROOT / f"runs_piece{current().get('piece', 'x')}_{datetime.datetime.now():%Y%m%d-%H%M}.zip"
     with zipfile.ZipFile(name, "w", zipfile.ZIP_DEFLATED) as z:
         for f in runs.rglob("*"):
             z.write(f, f.relative_to(ROOT))
-    print(f"Created {name.name}. Download it (right-click in the file list, Download) and hand it in.")
+    print(f"Created {name.name}.")
 
 
 if __name__ == "__main__":
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "show"
-    if cmd == "piece":
-        choose(sys.argv[2] if len(sys.argv) > 2 else "")
-    elif cmd == "pack":
+    cmd = sys.argv[1:] or ["show"]
+    if cmd[0] == "hook":
+        data = json.load(sys.stdin) if not sys.stdin.isatty() else {}
+        {"session": on_session, "pre": on_pre, "stop": on_stop}[cmd[1]](data)
+    elif cmd[0] == "pack":
         pack_runs()
-    elif cmd == "apply":
-        apply()
-    elif cmd == "reset":
-        reset()
-    elif cmd == "log":
-        log(" ".join(sys.argv[2:]))
     else:
-        sw = read_switches()
-        print(f"Piece {piece()}")
+        final = finalize(cur)
+        piece, sw = read_yaml()
+        print(f"Piece {piece or 'not chosen'}")
         for k in SWITCHES:
             print(f"  {k:<11} {'on' if sw[k] else 'off'}")

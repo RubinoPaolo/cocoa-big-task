@@ -1,7 +1,11 @@
-# Your switches. Change on / off, then run: python govern.py apply
-# First run: everything off.
+# The big task · your piece and your switches
+# 1. Set your piece and your switches here, then save (Ctrl+S).
+# 2. In the Claude panel, start a new session and ask: Do the task in TASK.md.
+# First run: all switches off. Then turn on one switch at a time, each time in a new session.
 
-context: off      # CLAUDE.md lines with what people here know (block 2)
+piece: 0          # the piece you were given: 1, 2 or 3
+
+context: off      # what people here know (block 2)
 spec: off         # acceptance criteria for your piece (block 2)
 check: off        # pass/fail check that runs before the agent may stop (block 3)
 hard_rules: off   # locks in the harness: what may be sent, to whom (block 4)

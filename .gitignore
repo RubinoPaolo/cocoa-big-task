@@ -5,10 +5,11 @@ runs_piece*.zip
 work/
 out/
 outbox/
-.claude/
 .govern/piece
-CLAUDE.md
-TASK.md
 specs/
 runs/
 checks/
+TASK.md
+.claude/agents/
+.govern/current.json
+.govern/runs.json
