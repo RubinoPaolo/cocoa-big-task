@@ -11,5 +11,6 @@
         "anthropic.claude-code"
       ]
     }
-  }
+  },
+  "postStartCommand": "python3 .devcontainer/claude_setup.py"
 }
