@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Runs every time the codespace starts. Lets Claude Code use the course key from the Codespaces
-secret ANTHROPIC_API_KEY without asking to sign in, skips the first-start questions, and makes new
-conversations in the Claude panel start in Manual mode (Claude asks before it acts). The panel reads the
-starting mode only from the user settings, ~/.claude/settings.json, not from the repository."""
+secret ANTHROPIC_API_KEY without asking to sign in, and skips the first-start questions.
+The Claude panel starts in its built-in mode, Auto: deny rules, ask rules and hooks still apply."""
 import json, os
 from pathlib import Path
 
@@ -31,6 +30,6 @@ try:
     us = json.loads(user.read_text())
 except (OSError, json.JSONDecodeError):
     us = {}
-us.setdefault("permissions", {})["defaultMode"] = "default"
+us.get("permissions", {}).pop("defaultMode", None)   # an earlier version set Manual here
 user.write_text(json.dumps(us, indent=2))
 print("Claude Code: course key", "ready" if key else "NOT FOUND (check the Codespaces secret ANTHROPIC_API_KEY)")
