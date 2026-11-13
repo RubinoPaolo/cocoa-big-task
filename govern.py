@@ -174,14 +174,16 @@ def on_pre(d):
         c.write_text(str(n))
         if n > BUDGET:
             decide("deny", f"Budget reached: {BUDGET} tool calls. Stop working. Write down what you have done and what is missing.")
+    # send.py counts only when it is run, not when it is read (cat tools/send.py)
+    sends = bool(re.search(r"(^|[;&|]\s*|python3?\s+)(\S*/)?send\.py\b", cmd))
     if sw.get("hard_rules") and cmd:
         if re.search(r"(^|[;&|]\s*)(rm|curl|wget|mail|sendmail)\b", cmd):
             decide("deny", "Blocked by a hard rule: this command is not allowed in this repository.")
-        if "send.py" in cmd:
+        if sends:
             problems = guard_send(cmd, d.get("cwd"))
             if problems:
                 decide("deny", "Blocked by a hard rule: " + "; ".join(problems))
-    if sw.get("human_gate") and "send.py" in cmd:
+    if sw.get("human_gate") and sends:
         decide("ask", "Human approval is on. Open out/briefing.md and read it before you say yes.")
     sys.exit(0)
 
